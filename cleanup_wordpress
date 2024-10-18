@@ -1,46 +1,259 @@
 #!/bin/bash
 
-# 停止并删除 Docker 容器
-echo "Stopping and removing Docker containers..."
-docker-compose -f /home/web/docker-compose.yml down --volumes --remove-orphans
+# 更新系统
+apt update -y && apt upgrade -y && apt install -y curl wget sudo socat
 
-# 删除 Docker 镜像（可选，如果你不再需要这些镜像）
-echo "Removing Docker images (optional)..."
-docker rmi nginx:latest php:7.4-fpm mysql:latest wordpress:latest
+# 安装 Docker
+curl -fsSL https://get.docker.com | sh
+curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
 
-# 删除 Docker 网络
-echo "Removing Docker networks..."
-docker network prune -f
+# 获取用户输入
+echo "请输入您要申请SSL证书的域名 (例如：example.com):"
+read DOMAIN
 
-# 删除 Docker 卷
-echo "Removing Docker volumes..."
-docker volume prune -f
+# 检查域名解析是否正常
+if ping -c 1 $DOMAIN &> /dev/null
+then
+  echo "域名解析正常，继续进行..."
+else
+  echo "域名解析失败，请检查您的域名设置！"
+  exit 1
+fi
 
-# 删除 /home/web 目录及其所有文件
-echo "Removing /home/web directory..."
-rm -rf /home/web
+# 提示输入数据库相关数据
+echo "请输入数据库主机地址 (默认: mysql):"
+read -p "WORDPRESS_DB_HOST (默认: mysql): " DB_HOST
+DB_HOST=${DB_HOST:-mysql}
 
-# 删除安装的 Docker Compose
-echo "Removing Docker Compose..."
-rm /usr/local/bin/docker-compose
+echo "请输入数据库名称 (默认: web):"
+read -p "WORDPRESS_DB_NAME (默认: web): " DB_NAME
+DB_NAME=${DB_NAME:-web}
 
-# 检查并停止 acme.sh 服务（可选）
-echo "Stopping acme.sh (optional)..."
-~/.acme.sh/acme.sh --stop
+echo "请输入数据库用户名 (默认: 随机生成):"
+read -p "WORDPRESS_DB_USER (默认: 随机生成): " DB_USER
+DB_USER=${DB_USER:-$(openssl rand -hex 12)}
 
-# 删除 acme.sh 和生成的 SSL 证书（可选）
-echo "Removing acme.sh and SSL certificates (optional)..."
-rm -rf ~/.acme.sh /home/web/certs
+echo "请输入数据库密码 (默认: 随机生成):"
+read -p "WORDPRESS_DB_PASSWORD (默认: 随机生成): " DB_PASSWORD
+DB_PASSWORD=${DB_PASSWORD:-$(openssl rand -hex 16)}
 
-# 删除 Docker 和相关包（可选）
-echo "Removing Docker (optional)..."
-apt-get remove --purge -y docker docker.io docker-ce docker-ce-cli containerd runc
-apt-get autoremove -y
-apt-get clean
+# 打印确认信息
+echo "---------------------"
+echo "数据库配置信息如下："
+echo "数据库主机: $DB_HOST"
+echo "数据库名称: $DB_NAME"
+echo "数据库用户: $DB_USER"
+echo "数据库密码: $DB_PASSWORD"
+echo "---------------------"
+read -p "确认这些设置？(y/n): " CONFIRM
+if [[ $CONFIRM != "y" ]]; then
+    echo "操作取消。"
+    exit 1
+fi
 
-# 删除 setup_wordpress.sh 脚本文件
-echo "Removing setup_wordpress.sh script..."
-rm -f /path/to/setup_wordpress.sh  # 请将 /path/to/setup_wordpress.sh 替换为实际路径
+# 创建目录结构
+mkdir -p /home/web/html /home/web/mysql /home/web/certs /home/web/logs/nginx /home/web/logs/php /home/web/php-fpm
 
-# 最后确认删除完成
-echo "Cleanup completed. WordPress environment and setup script removed from VPS."
+# 创建 Docker Compose 配置文件
+cat > /home/web/docker-compose.yml <<EOL
+version: '3.8'
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./certs:/etc/nginx/certs
+      - ./html:/var/www/html
+      - /home/web/logs/nginx:/var/log/nginx
+    depends_on:
+      - php
+    networks:
+      - webnet
+
+  php:
+    build: ./php-fpm
+    container_name: php
+    restart: always
+    volumes:
+      - ./php/php.ini:/usr/local/etc/php/php.ini
+      - ./html:/var/www/html
+      - /home/web/logs/php:/var/log/php
+    networks:
+      - webnet
+    depends_on:
+      - mysql
+    healthcheck:
+      test: ["CMD", "php-fpm", "-t"]
+      interval: 1m30s
+      timeout: 10s
+      retries: 3
+
+  mysql:
+    image: mysql:latest
+    container_name: mysql
+    restart: always
+    volumes:
+      - ./mysql:/var/lib/mysql
+      - /home/web/logs/mysql:/var/log/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: webroot
+      MYSQL_DATABASE: $DB_NAME
+      MYSQL_USER: $DB_USER
+      MYSQL_PASSWORD: $DB_PASSWORD
+    networks:
+      - webnet
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  wordpress:
+    image: wordpress:latest
+    container_name: wordpress
+    restart: always
+    environment:
+      WORDPRESS_DB_HOST: $DB_HOST
+      WORDPRESS_DB_USER: $DB_USER
+      WORDPRESS_DB_PASSWORD: $DB_PASSWORD
+      WORDPRESS_DB_NAME: $DB_NAME
+    volumes:
+      - ./html:/var/www/html
+      - /home/web/logs/wp:/var/log/wp
+    depends_on:
+      - mysql
+    networks:
+      - webnet
+
+networks:
+  webnet:
+    driver: bridge
+EOL
+
+# 创建 PHP-FPM 的 Dockerfile
+cat > /home/web/php-fpm/Dockerfile <<EOL
+FROM php:7.4-fpm
+
+# 安装 mysqli 扩展
+RUN apt-get update && apt-get install -y libpng-dev libjpeg-dev libfreetype6-dev && docker-php-ext-install gd mysqli pdo pdo_mysql
+
+# 启用 mysqli
+RUN docker-php-ext-enable mysqli
+EOL
+
+# 创建 PHP 配置文件
+mkdir -p /home/web/php
+cat > /home/web/php/php.ini <<EOL
+; PHP 主配置文件 (php.ini)
+
+; 文件上传相关配置
+upload_max_filesize = 10000M
+post_max_size = 10000M
+
+; 执行时间限制
+max_execution_time = 600
+max_input_time = 600
+
+; 内存使用
+memory_limit = 512M
+
+; 时区设置
+date.timezone = Asia/Shanghai
+
+; 日志记录
+log_errors = On
+error_log = /var/log/php/php_errors.log
+
+; 其他常用配置
+display_errors = Off
+file_uploads = On
+max_file_uploads = 50
+EOL
+
+# 创建 Nginx 配置文件
+cat > /home/web/nginx.conf <<EOL
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    client_max_body_size 10G;
+
+    server {
+        listen 80;
+        server_name $DOMAIN;
+
+        return 301 https://$host$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name $DOMAIN;
+
+        ssl_certificate /etc/nginx/certs/cert.pem;
+        ssl_certificate_key /etc/nginx/certs/key.pem;
+
+        root /var/www/html;
+        index index.php;
+
+        location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2)$ {
+            expires max;
+            log_not_found off;
+        }
+
+        try_files $uri $uri/ /index.php?$args;
+
+        error_log /var/log/nginx/error.log warn;
+
+        location ~ \.php$ {
+            fastcgi_pass php:9000;
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+            include fastcgi_params;
+            fastcgi_read_timeout 300;
+        }
+
+        location ~ /\.ht {
+            deny all;
+        }
+    }
+}
+EOL
+
+# 启动 Docker 容器
+cd /home/web
+docker-compose up -d
+
+# 停止 Nginx 以释放 80 端口
+docker-compose stop nginx
+
+# 生成 SSL 证书
+curl https://get.acme.sh | sh
+~/.acme.sh/acme.sh --issue -d $DOMAIN --standalone
+~/.acme.sh/acme.sh --installcert -d $DOMAIN --key-file /home/web/certs/key.pem --fullchain-file /home/web/certs/cert.pem
+
+# 重启 Nginx 容器
+docker-compose start nginx
+
+# 修改 wp-config.php，启用调试模式并记录日志
+sed -i "/\/\*\* That's all, stop editing! Happy publishing. \*\//i define( 'WP_DEBUG', true ); define( 'WP_DEBUG_LOG', true ); define( 'WP_DEBUG_DISPLAY', false );" /home/web/html/wp-config.php
+
+# 确保 wp-content 目录有写入权限
+sudo chmod -R 755 /home/web/html/wp-content
+sudo chown -R www-data:www-data /home/web/html/wp-content
+
+# 重启所有服务
+docker-compose restart
