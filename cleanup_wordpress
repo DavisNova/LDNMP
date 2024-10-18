@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# 停止并删除 Docker 容器
+echo "Stopping and removing Docker containers..."
+docker-compose -f /home/web/docker-compose.yml down --volumes --remove-orphans
+
+# 删除 Docker 镜像（可选，如果你不再需要这些镜像）
+echo "Removing Docker images (optional)..."
+docker rmi nginx:latest php:7.4-fpm mysql:latest wordpress:latest
+
+# 删除 Docker 网络
+echo "Removing Docker networks..."
+docker network prune -f
+
+# 删除 Docker 卷
+echo "Removing Docker volumes..."
+docker volume prune -f
+
+# 删除 /home/web 目录及其所有文件
+echo "Removing /home/web directory..."
+rm -rf /home/web
+
+# 删除安装的 Docker Compose
+echo "Removing Docker Compose..."
+rm /usr/local/bin/docker-compose
+
+# 检查并停止 acme.sh 服务（可选）
+echo "Stopping acme.sh (optional)..."
+~/.acme.sh/acme.sh --stop
+
+# 删除 acme.sh 和生成的 SSL 证书（可选）
+echo "Removing acme.sh and SSL certificates (optional)..."
+rm -rf ~/.acme.sh /home/web/certs
+
+# 删除 Docker 和相关包（可选）
+echo "Removing Docker (optional)..."
+apt-get remove --purge -y docker docker.io docker-ce docker-ce-cli containerd runc
+apt-get autoremove -y
+apt-get clean
+
+# 删除 setup_wordpress.sh 脚本文件
+echo "Removing setup_wordpress.sh script..."
+rm -f /path/to/setup_wordpress.sh  # 请将 /path/to/setup_wordpress.sh 替换为实际路径
+
+# 最后确认删除完成
+echo "Cleanup completed. WordPress environment and setup script removed from VPS."
